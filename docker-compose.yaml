@@ -1,0 +1,11 @@
+services:
+  redfin-scraper:
+    build: .
+    restart: unless-stopped
+    shm_size: "1gb"
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+      # Optional — only if Redfin starts refusing your server's IP.
+      # - REDFIN_PROXY=http://user:pass@host:port
