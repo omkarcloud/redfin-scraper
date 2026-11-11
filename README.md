@@ -150,7 +150,7 @@ You're a developer — we know how hard completing a project can be. So we offer
 - [**G2 Scraper**](https://www.omkar.cloud/tools/g2-scraper) — G2 product details, ratings & AI-found contacts
 - [**Website Email Contact Scraper**](https://www.omkar.cloud/tools/website-email-contact-scraper) — emails, phones & socials from any website
 - [**AliExpress Scraper**](https://www.omkar.cloud/tools/aliexpress-scraper-api) — live product details, SKU variants, stock & shipping
-- [**Booking Scraper**](https://www.omkar.cloud/tools/booking-scraper) — Booking.com hotels: prices, ratings, rooms & amenities
+- [**Realtor Com Scraper**](https://github.com/omkarcloud/realtor-com-scraper) — Realtor.com homes for sale, sold prices, rentals, agents & value estimates
 - [**Crexi Scraper**](https://github.com/omkarcloud/crexi-scraper) — commercial real estate for sale & lease, auctions & brokers: price, rent, spaces & photos
 
 ## ⭐ Love It? [Star It ⭐!](https://github.com/omkarcloud/redfin-scraper)
