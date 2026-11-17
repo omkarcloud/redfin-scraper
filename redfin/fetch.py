@@ -64,7 +64,7 @@ Failure taxonomy (scraper_errors, mapped to HTTP by route_glue):
   RedfinBadRequest     upstream rejected the params           — never retried
   RedfinNotFound       unknown property / region / agent      — never retried
 """
-import json
+import fastjson
 import os
 import sys
 import threading
@@ -78,9 +78,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import browser_client
 import config
 import egress
-from browser_client import BoxRefused, BoxUnavailable, RemintBudgetExceeded
+import identity_pool
+from browser_client import BoxRefused, BoxUnavailable
 from scraper_errors import BadRequest, Blocked, NotFound, UpstreamError
 from redfin.refs import SITE
+from scraper_utils import sessions
 
 IMPERSONATE = "chrome"
 TIMEOUT = 40            # the agent directory is ~145 KB, a 50-home search ~130 KB
@@ -141,13 +143,7 @@ def _proxy_for_thread():
 
 def _drop_session():
     """Close the thread's session so a poisoned keep-alive / exit dies."""
-    sess = getattr(_local, "session", None)
-    _local.session = None
-    if sess is not None:
-        try:
-            sess.close()
-        except Exception:
-            pass
+    sessions.drop(_local)
 
 
 def _note_block():
@@ -156,13 +152,20 @@ def _note_block():
 
 
 # ---- the AWS WAF token (shared, box-minted) ---------------------------------------
-# One process-wide token: the recipe's `expires_at` bounds its age, a 403 on
-# a token call re-mints it once (single-flight through browser_client).
+# One process-wide token in an identity_pool.Pool (shared mode): the recipe's
+# `expires_at` bounds its age, a 403 on a token call replaces it once per
+# block wave (get(replace=used): peers blocked on the same token share the
+# one re-mint, a peer arriving after it takes the result). The mint goes
+# through ONE sticky exit per process (_MINT_EXIT, the pool's exit_pool),
+# rotated when the token is replaced after a block and when the box refuses
+# a mint, so a bad exit is not reused. Until 2026-11-04 each call drew
+# config.redfin_mint_proxy() itself (a random port), so K threads starting
+# cold ran K parallel mints and everything past the 5/min re-mint budget
+# failed as RedfinBlocked; the pool single-flights the cold burst to one.
 # REDFIN_WAF_TOKEN in the environment seeds the token for a local dev run
 # (the Mac has no browser box; mint it with patchright and export it).
-_BOX_ERRORS = (BoxUnavailable, BoxRefused, RemintBudgetExceeded)
-_shared = {"token": None, "expires_at": 0.0}
-_shared_lock = threading.Lock()
+_MINT_EXIT = browser_client.ExitPool(BOX_SITE, config.redfin_mint_proxy, size=1)
+REMINT_GRACE_S = 10      # a re-mint this soon after the last mint reuses it (a peer just re-minted)
 
 
 def _token_of(ident):
@@ -172,36 +175,38 @@ def _token_of(ident):
     return token or None
 
 
-def _current_token():
-    with _shared_lock:
-        if _shared["token"] and time.time() < _shared["expires_at"]:
-            return _shared["token"]
-    seeded = os.environ.get("REDFIN_WAF_TOKEN")
-    if seeded:
-        return seeded
-    return None
-
-
-def _mint_token(force=False):
-    """Mint on the browser box through config.redfin_mint_proxy() (a US
-    residential exit: the WAF only self-solves there). Raises RedfinBlocked
-    when the box cannot deliver one."""
-    if not force:
-        live = _current_token()
-        if live:
-            return live
+def _mint(key, hint):
+    """The pool's mint function: the browser box through `hint` (the pool's
+    sticky exit from config.redfin_mint_proxy(), a US residential exit: the
+    WAF only self-solves there). Raises RedfinBlocked when the box cannot
+    deliver a token; a refused mint rotates the exit."""
     try:
-        ident = browser_client.identity(BOX_SITE, proxy=config.redfin_mint_proxy(), force=force)
-    except _BOX_ERRORS as e:
+        ident = browser_client.mint(BOX_SITE, proxy=hint)
+    except (BoxUnavailable, BoxRefused) as e:
+        if isinstance(e, BoxRefused):
+            _MINT_EXIT.rotate(hint)
         raise RedfinBlocked(f"aws-waf-token mint failed: {type(e).__name__}: {e}")
     token = _token_of(ident)
     if not token:
         raise RedfinBlocked("browser box answered without an aws-waf-token")
-    with _shared_lock:
-        _shared["token"] = token
-        _shared["expires_at"] = float(ident.get("expires_at") or (time.time() + config.REDFIN_TOKEN_TTL_S))
-    print(f"redfin: aws-waf-token {'re-' if force else ''}minted ({len(token)} chars)")
-    return token
+    print(f"redfin: aws-waf-token minted ({len(token)} chars)")
+    return identity_pool.Identity(token, exit=hint,
+                                  expires_at=float(ident.get("expires_at") or (time.time() + config.REDFIN_TOKEN_TTL_S)))
+
+
+_tokens = identity_pool.Pool(BOX_SITE, _mint, exit_pool=_MINT_EXIT, mints_per_minute=5, min_interval=REMINT_GRACE_S,
+                             seed={"": os.environ["REDFIN_WAF_TOKEN"]} if os.environ.get("REDFIN_WAF_TOKEN") else None)
+
+
+def _token(replace=None):
+    """The shared token identity (its `value` is the cookie), minted when the
+    process has none; `replace` = the identity a blocked call carried, re-
+    minted only if it is still the current one and older than REMINT_GRACE_S.
+    The pool's mint budget maps to RedfinBlocked like a refused mint."""
+    try:
+        return _tokens.get(replace=replace)
+    except identity_pool.MintBudgetExceeded as e:
+        raise RedfinBlocked(f"aws-waf-token mint failed: {e}")
 
 
 # ---- requests --------------------------------------------------------------------
@@ -227,15 +232,16 @@ def _decode(text, label):
     """The `{}&&{...}` envelope (or plain JSON) -> dict."""
     body = text[len(ENVELOPE_PREFIX):] if text.startswith(ENVELOPE_PREFIX) else text
     try:
-        return json.loads(body)
+        return fastjson.loads(body)
     except ValueError:
         raise RedfinUpstreamError(f"non-JSON response from {label}: {text[:120]!r}")
 
 
-def _retrying(fn, token_call=False):
+def _retrying(fn, remint=None):
     """Shared retry policy: a transport error drops the session; a block
     drops it, parks the thread on the cooldown exit and, for a token call,
-    re-mints the token before the next try."""
+    runs `remint()` (replace the token the blocked call carried) before the
+    next try."""
     last = None
     for attempt in range(1, config.MAX_RETRIES + 1):
         try:
@@ -244,9 +250,9 @@ def _retrying(fn, token_call=False):
             last = e
             _drop_session()
             _note_block()
-            if token_call and attempt < config.MAX_RETRIES:
+            if remint is not None and attempt < config.MAX_RETRIES:
                 try:
-                    _mint_token(force=True)
+                    remint()
                 except RedfinBlocked as mint_error:
                     last = mint_error
         except RedfinUpstreamError as e:
@@ -261,12 +267,14 @@ def get_raw(path, params=None, *, label=None, token=False):
     """GET SITE+path -> decoded JSON (envelope or plain). `token=True`
     sends the WAF cookie (minting it first when the process has none)."""
     label = label or path.split("?")[0]
+    used = [None]           # the token identity the last attempt carried (replaced after a block)
 
     def once():
         sess = _session()
         cookies = None
         if token:
-            cookies = {WAF_COOKIE: _mint_token()}
+            used[0] = _token()
+            cookies = {WAF_COOKIE: used[0].value}
         try:
             resp = sess.get(SITE + path, params=params, headers=JSON_HEADERS, cookies=cookies,
                             timeout=TIMEOUT, allow_redirects=True)
@@ -274,7 +282,7 @@ def get_raw(path, params=None, *, label=None, token=False):
             raise RedfinUpstreamError(f"request failed: {type(e).__name__}: {e}")
         _classify(resp, label)
         return _decode(resp.text, label)
-    return _retrying(once, token_call=token)
+    return _retrying(once, remint=(lambda: _token(replace=used[0])) if token else None)
 
 
 # resultCode values seen 2026-10-30/31: 0 success; 101 "this property does

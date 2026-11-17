@@ -169,3 +169,38 @@ def headers_for(ident, **extra):
            "accept-language": egress.site_accept_language("redfin")}
     out.update({k.lower(): v for k, v in extra.items() if v is not None})
     return {k: v for k, v in out.items() if v != ""}
+
+
+class ExitPool:
+    """The hosted client keeps a pool of sticky proxy exits for its browsers.
+    Here there is one: whatever `mint()` (the config proxy helper) returns,
+    kept until rotate() asks for another. None means your own connection."""
+
+    def __init__(self, site, mint, size=1, **kwargs):
+        self.site, self._mint = site, mint
+        self._exit, self._drawn = None, False
+        self._lock = threading.Lock()
+
+    def get(self, key=""):
+        with self._lock:
+            if not self._drawn:
+                self._exit, self._drawn = self._mint(), True
+            return self._exit
+
+    def rotate(self, proxy, key=""):
+        """Replace `proxy` with a fresh exit. False when it was already replaced."""
+        with self._lock:
+            if not self._drawn or self._exit != proxy:
+                return False
+            self._exit = self._mint()
+            return True
+
+    def current(self, key=""):
+        """The exit in use, as a list (empty before the first get())."""
+        with self._lock:
+            return [self._exit] if self._drawn else []
+
+    def reset(self, key=None):
+        """Forget the exit; the next get() draws a new one."""
+        with self._lock:
+            self._exit, self._drawn = None, False

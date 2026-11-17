@@ -26,6 +26,7 @@ from redfin.refs import (
     REGION_TYPE_OF_AUTOCOMPLETE, SEARCH_STATUS_NAMES, SITE, WORD_OF_REGION_TYPE,
     agent_link, home_link, region_id,
 )
+from scraper_utils.text import trimmed as _str
 
 PHOTO_CDN = "https://ssl.cdn-redfin.com/photo"
 _REGION_PATH_RE = re.compile(r"^/(neighborhood|zipcode|state|county|city|school|school-district)/([^/]+)")
@@ -123,13 +124,6 @@ def _text(value):
     if value is None:
         return None
     text = " ".join(_TAG_RE.sub(" ", str(value)).split())
-    return text or None
-
-
-def _str(value):
-    if value is None or isinstance(value, (dict, list)):
-        return None
-    text = str(value).strip()
     return text or None
 
 
